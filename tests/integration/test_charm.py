@@ -14,7 +14,9 @@ from helpers import (
     check_if_test_documents_stored,
     generate_collection_id,
     get_address_of_unit,
+    get_latest_unit_id,
     get_leader_id,
+    mongodb_uri,
     primary_host,
     run_mongo_op,
     secondary_mongo_uris_with_sync_delay,
@@ -23,6 +25,7 @@ from lightkube import AsyncClient
 from lightkube.resources.core_v1 import Pod
 from pymongo import MongoClient
 from pytest_operator.plugin import OpsTest
+from storage_helpers import StorageAnalyzer
 
 logger = logging.getLogger(__name__)
 
@@ -275,3 +278,101 @@ async def test_replication_data_consistency(ops_test: OpsTest):
         f"{synced_secondaries_count}/{len(secondaries)} secondaries fully synced with primary."
     )
     assert synced_secondaries_count > 0
+
+
+async def test_reuse_storage_volumes_after_scaling(ops_test: OpsTest):
+    """Test the storage volumes are reused after scaling down / up again.
+
+    Verifies that:
+        - data is well stored in the nodes
+        - on scaling down the data volumes are not deleted, only detached kept around in volumes
+        - on scaling up again, the volumes are reused
+        - the reused volumes contain the previously stored data
+    """
+    # create a Storage Analyzer
+    storage_analyzer = StorageAnalyzer(ops_test)
+
+    # generate a collection id
+    collection_id = generate_collection_id()
+
+    # Create a database and a collection (lazily)
+    create_collection = await run_mongo_op(
+        ops_test, f'db.createCollection("{collection_id}")', suffix=f"?replicaSet={APP_NAME}"
+    )
+    assert create_collection.succeeded and create_collection.data["ok"] == 1
+
+    # run storage analysis at t0
+    await storage_analyzer.run()
+
+    # add one unit and wait for idle
+    await ops_test.model.applications[APP_NAME].scale(scale=5)
+    await ops_test.model.wait_for_idle(
+        apps=[APP_NAME], status="active", timeout=1000, wait_for_exact_units=5
+    )
+    assert len(ops_test.model.applications[APP_NAME].units) == 5
+
+    # Store a few test documents
+    insert_many_docs = await run_mongo_op(
+        ops_test,
+        f"db.{collection_id}.insertMany({TEST_DOCUMENTS})",
+        suffix=f"?replicaSet={APP_NAME}",
+    )
+    assert insert_many_docs.succeeded and len(insert_many_docs.data["insertedIds"]) == 2
+
+    # attempt ensuring that the replication happened on all secondaries
+    time.sleep(24)
+
+    # query the secondaries by targeting units
+    # choosing the 3rd unit, going with the assumption that juju downscales
+    # from the higher unit downwards
+    latest_secondary_mongo_uri = await mongodb_uri(ops_test, [get_latest_unit_id(ops_test)])
+    await check_if_test_documents_stored(
+        ops_test, collection_id, mongo_uri=latest_secondary_mongo_uri
+    )
+
+    # run storage analysis at t1
+    await storage_analyzer.run()
+
+    # scale down to 2 units
+    await ops_test.model.applications[APP_NAME].scale(scale=2)
+    await ops_test.model.wait_for_idle(
+        apps=[APP_NAME], status="active", timeout=3000, wait_for_exact_units=2
+    )
+    assert len(ops_test.model.applications[APP_NAME].units) == 2
+
+    # scale back up by 1 unit
+    await ops_test.model.applications[APP_NAME].scale(scale=4)
+    await ops_test.model.wait_for_idle(
+        apps=[APP_NAME], status="active", timeout=3000, wait_for_exact_units=4
+    )
+    assert len(ops_test.model.applications[APP_NAME].units) == 4
+
+    # check if data is still stored in the latest volume (reused one)
+    latest_secondary_mongo_uri = await mongodb_uri(ops_test, [get_latest_unit_id(ops_test)])
+    await check_if_test_documents_stored(
+        ops_test, collection_id, mongo_uri=latest_secondary_mongo_uri
+    )
+
+    # run storage analysis at t2
+    await storage_analyzer.run()
+
+    # check if k8s is reusing the previous volume from before scale up / down operations
+    assert len(storage_analyzer.units_created()) == 5
+
+    assert len(storage_analyzer.volumes_created()) == 5
+
+    # check if each juju unit exclusively reuses same pvc
+    for unit, pvc in storage_analyzer.unit_to_pvcs().items():
+        assert len(pvc) == 1
+
+    # check if each pvc is exclusively used by the same unit
+    for pvc, unit in storage_analyzer.pvc_to_units().items():
+        assert len(unit) == 1
+
+    # remove the collection
+    await run_mongo_op(
+        ops_test,
+        f"db.{collection_id}.drop()",
+        suffix=f"?replicaSet={APP_NAME}",
+        expecting_output=False,
+    )
